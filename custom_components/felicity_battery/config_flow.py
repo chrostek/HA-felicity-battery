@@ -34,7 +34,7 @@ class FelicityConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             host = user_input[CONF_HOST]
             port = user_input[CONF_PORT]
 
-            # Не допускаем дубликаты для одного и того же host:port
+            # Don't allow duplicates for the same host:port
             for existing in self._async_current_entries():
                 if existing.data.get(CONF_HOST) == host and existing.data.get(CONF_PORT) == port:
                     return self.async_abort(reason="already_configured")
