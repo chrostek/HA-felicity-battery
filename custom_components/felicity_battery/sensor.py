@@ -40,6 +40,29 @@ def _fallback_model(basic: dict[str, Any]) -> str:
     return DEFAULT_MODEL
 
 
+def _bcu_version(basic: dict[str, Any]) -> str | None:
+    """Format the BCU (Battery Control Unit) version - M1SwVer + DSwVer,
+    e.g. "203-05-86". Confirmed exact match against the FSOLAR app's own
+    "Versionsdaten" screen.
+
+    Used both for the "Battery BCU Version" sensor and as the device
+    page's "Firmware" field: of the four version numbers this battery
+    reports (BCU/SCU/BMU/LCD), BCU is the one Felicity's own app lists
+    first, and "Control Unit" is the master pack-level controller (the
+    one deciding charge/discharge behaviour, reporting Estate/workM,
+    etc.) - the most reasonable single value to represent "the battery's
+    firmware version" if only one can be shown. The Wi-Fi module's own
+    firmware (previously shown here) stays available separately as the
+    "WiFi Module FW Version" sensor.
+    """
+    major = basic.get("M1SwVer")
+    minor = basic.get("DSwVer")
+    if not isinstance(major, (int, float)) or not isinstance(minor, (int, float)):
+        return None
+    minor = int(minor)
+    return f"{int(major)}-{minor // 100:02d}-{minor % 100:02d}"
+
+
 def _estate_mode(code: Any) -> int | None:
     """Decode the charge/discharge/standby mode out of the 'Estate' field.
 
@@ -70,6 +93,7 @@ class FelicitySensorDescription(SensorEntityDescription):
 
 
 SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
+    # --- Main operational sensors ---
     FelicitySensorDescription(
         key="soc",
         name="Battery SOC",
@@ -105,6 +129,7 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:flash",
     ),
+    # Split charge/discharge current and power
     FelicitySensorDescription(
         key="charge_current",
         name="Battery Charge Current",
@@ -145,6 +170,11 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         icon="mdi:swap-vertical",
     ),
     FelicitySensorDescription(
+        # NOT two independent temperature probes - confirmed against the
+        # FSOLAR app ("Max. Temp. der Zelle: 28°C" / "Min. Temp. der
+        # Zelle: 22°C"): this is the max/min across the pack's cell
+        # temperature sensors, analogous to Max/Min Cell Voltage below.
+        # Key kept as temp1 for entity continuity.
         key="temp1",
         name="Max Cell Temperature",
         native_unit_of_measurement=UnitOfTemperature.CELSIUS,
@@ -164,9 +194,13 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         suggested_display_precision=1,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+
+    # --- Additional battery telemetry (state of health, capacity,
+    # voltage limits, working mode) - values confirmed by comparing the
+    # raw readings against the FSOLAR app's own displayed numbers ---
     FelicitySensorDescription(
-        # Batsoc[0][1] = "battSoh" per Felicity's own protocol, /10.
-        # Matches the Cloud UI's reported 97% exactly.
+        # Batsoc[0][1], scale /10. Matches the Cloud UI's reported 97%
+        # exactly.
         key="soh",
         name="Battery SOH",
         native_unit_of_measurement=PERCENTAGE,
@@ -175,6 +209,8 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         suggested_display_precision=1,
     ),
     FelicitySensorDescription(
+        # Batsoc[0][2], scale /1000. Matches the FSOLAR app's displayed
+        # battery capacity (Ah) exactly.
         key="capacity_ah",
         name="Battery Capacity",
         native_unit_of_measurement="Ah",
@@ -184,6 +220,8 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     FelicitySensorDescription(
+        # LVolCur[0][0], scale /10. Exact match to the charge voltage
+        # limit shown in the FSOLAR app.
         key="charge_voltage_limit",
         name="Charge Voltage Limit",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
@@ -194,6 +232,8 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     FelicitySensorDescription(
+        # LVolCur[0][1], scale /10. Exact match to the discharge voltage
+        # limit shown in the FSOLAR app.
         key="discharge_voltage_limit",
         name="Discharge Voltage Limit",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
@@ -204,10 +244,16 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     FelicitySensorDescription(
+        # workM, decoded using the mode table below (0=Power On,
+        # 1=Standby, 2=Battery Mode, 3=Discharge only, 4=Charge only,
+        # 5=Low power, 6=Fault, 7=Shutdown, 8=Test, 9=Upgrade), confirmed
+        # against observed values and the FSOLAR app's own state display.
         key="working_mode",
         name="Working Mode",
         icon="mdi:state-machine",
     ),
+
+    # --- Cell-level diagnostics ---
     FelicitySensorDescription(
         key="max_cell_v",
         name="Max Cell Voltage",
@@ -238,6 +284,11 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         suggested_display_precision=3,
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+
+    # --- Pack/string voltages (BatcelList[0]) - keys unchanged
+    # (cell_N_v) for entity continuity, but renamed: these aren't
+    # individual cells, they're 12 sub-pack/string voltages (~53V), see
+    # BatcelList[1] further below for the real per-cell voltages. ---
     FelicitySensorDescription(
         key="cell_1_v", name="Pack 1 Voltage",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
@@ -334,6 +385,11 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         device_class=SensorDeviceClass.VOLTAGE, state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:battery", suggested_display_precision=2, entity_category=EntityCategory.DIAGNOSTIC,
     ),
+
+    # --- Real individual cell voltages 1-16 (BatcelList[1], previously
+    # never parsed/exposed at all) - confirmed against the FSOLAR app's
+    # displayed max/min cell voltage. New keys, since this is a
+    # different physical quantity than the pack voltages above. ---
     FelicitySensorDescription(
         key="cell_real_1_v", name="Cell 1 Voltage",
         native_unit_of_measurement=UnitOfElectricPotential.VOLT,
@@ -430,6 +486,8 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         device_class=SensorDeviceClass.VOLTAGE, state_class=SensorStateClass.MEASUREMENT,
         icon="mdi:battery", suggested_display_precision=3, entity_category=EntityCategory.DIAGNOSTIC,
     ),
+
+    # --- Limits from runtime data ---
     FelicitySensorDescription(
         key="max_charge_current",
         name="Max Charge Current (runtime)",
@@ -462,12 +520,24 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         icon="mdi:alert-circle",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+
+    # --- Info / firmware / type / serials ---
     FelicitySensorDescription(
+        # NOTE: this is the Wi-Fi module's own firmware (basic["version"]),
+        # NOT a battery board version - the FSOLAR app shows it separately
+        # from BCU/SCU/BMU/LCD (see below), which are the actual battery
+        # firmware versions. Renamed to avoid the misleading "Battery FW"
+        # label; key kept as fw_version for entity continuity.
         key="fw_version",
         name="WiFi Module FW Version",
         icon="mdi:chip",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+    # NOTE: standalone "Battery BMS M1/M2 FW" sensors (raw M1SwVer/M2SwVer)
+    # were removed - they were an exact subset of BCU/SCU below (e.g.
+    # M1SwVer is literally the first component of BCU: "203-05-86"),
+    # so they added no information, just clutter. bms_m1_fw/bms_m2_fw keys
+    # are intentionally no longer used anywhere.
     FelicitySensorDescription(
         # Confirmed against the FSOLAR app's "Versionsdaten" screen:
         # BCU = M1SwVer + DSwVer (formatted "0X-YY"), e.g. 203-05-86.
@@ -498,6 +568,7 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
     FelicitySensorDescription(
+        # From 'wifilocalMonitor:get Date' (not previously queried at all).
         key="wifi_rssi",
         name="WiFi Module Signal",
         device_class=SensorDeviceClass.SIGNAL_STRENGTH,
@@ -529,6 +600,8 @@ SENSOR_DESCRIPTIONS: tuple[FelicitySensorDescription, ...] = (
         icon="mdi:wifi",
         entity_category=EntityCategory.DIAGNOSTIC,
     ),
+
+    # --- Settings / thresholds (dev set infor) ---
     FelicitySensorDescription(
         key="ttl_pack",
         name="Battery Pack Count",
@@ -660,7 +733,12 @@ class FelicitySensor(CoordinatorEntity, SensorEntity):
         data = self.coordinator.data or {}
         serial = data.get("DevSN") or data.get("wifiSN") or self._entry.entry_id
         basic = data.get("_basic") or {}
-        sw_version = basic.get("version")
+        # Show the BCU (Battery Control Unit) version here - see
+        # _bcu_version() for why that one was picked among the battery's
+        # four version numbers. Falls back to the Wi-Fi module's own
+        # firmware if BCU data isn't available (e.g. a different device/
+        # firmware that doesn't expose M1SwVer/DSwVer under those names).
+        sw_version = _bcu_version(basic) or basic.get("version")
         host = self._entry.data.get(CONF_HOST)
         serial_display = f"{serial} ({host})" if host else serial
         model = self._entry.data.get("model") or _fallback_model(basic)
@@ -831,25 +909,26 @@ class FelicitySensor(CoordinatorEntity, SensorEntity):
         # --- Pack/string OR real cell voltages (BatcelList) - ADAPTIVE,
         # see also the `name` property override below.
         #
-        # Backward-compat note: the raw magnitude/
-        # meaning of BatcelList row 0 is NOT the same across all Felicity
-        # battery models:
-        #   - protocol Type 119 (this integration's LUX-X-96050HG01/
-        #     BCU600050-family test unit): row 0 field is named "cellVolt*"
-        #     but with magnification -2 (i.e. /100), and the device's real
-        #     per-cell data lives in a SECOND array.
-        #     -> two arrays present at runtime.
-        #   - protocol Type 48/112: row 0 is
-        #     named "cellVolt*" with magnification -3 (i.e. /1000) and
-        #     there is no second array at all - row 0 already *is* the
-        #     real per-cell voltage.
-        #     -> only one array present at runtime.
+        # Backward-compat note: the meaning of BatcelList row 0 is NOT the
+        # same on every Felicity battery model. On this integration's own
+        # test unit (a multi-module pack), row 0 turned out to be
+        # pack/string-level voltages (~53V each, /100 scale) rather than
+        # individual cells, with the real per-cell data only showing up in
+        # a second array (row 1, /1000 scale) - confirmed against the
+        # FSOLAR app's own max/min cell voltage display. The original,
+        # unpatched integration (written for a different, presumably
+        # single-module battery) only ever saw one array and treated row 0
+        # directly as real per-cell voltage (/1000) - which is exactly
+        # right for that kind of device, just wrong for a multi-module one
+        # like this integration's test unit.
         #
-        # So instead of hardcoding one interpretation, we branch on how
-        # many BatcelList arrays the device actually sends:
+        # Rather than hardcoding one interpretation and risking silently
+        # wrong values on whichever device shape wasn't tested, this code
+        # branches on how many BatcelList arrays the device actually sends
+        # at runtime:
         #   - 1 array  -> "cell_N_v" behaves exactly like the original,
-        #     unpatched integration (row 0, /1000, "Cell N Voltage") so a
-        #     FLA48200-style upgrade is a complete no-op for these
+        #     unpatched integration (row 0, /1000, "Cell N Voltage"), so a
+        #     single-module-style upgrade is a complete no-op for these
         #     entities: same key, same scale, same name, same history.
         #     "cell_real_N_v" stays unpopulated (filtered out at setup).
         #   - 2+ arrays -> "cell_N_v" becomes "Pack N Voltage" (/100, row
@@ -919,15 +998,16 @@ class FelicitySensor(CoordinatorEntity, SensorEntity):
         if key == "fw_version":
             return basic.get("version")
 
-        if key in ("bcu_version", "scu_version", "bmu_version"):
+        if key == "bcu_version":
+            return _bcu_version(basic)
+
+        if key in ("scu_version", "bmu_version"):
             def _fmt(major: Any, minor: Any) -> str | None:
                 if not isinstance(major, (int, float)) or not isinstance(minor, (int, float)):
                     return None
                 minor = int(minor)
                 return f"{int(major)}-{minor // 100:02d}-{minor % 100:02d}"
 
-            if key == "bcu_version":
-                return _fmt(basic.get("M1SwVer"), basic.get("DSwVer"))
             if key == "scu_version":
                 return _fmt(basic.get("M2SwVer"), basic.get("CtHwVer"))
             if key == "bmu_version":
@@ -959,8 +1039,9 @@ class FelicitySensor(CoordinatorEntity, SensorEntity):
             # The device's own 'ttlPack' field (in _settings) is transport
             # metadata (how many concatenated JSON objects make up the
             # "get dev set infor" reply), NOT the physical pack count.
-            # BMSpara[0][0] is officially named "cellNumber" - use that
-            # directly now. Falls back to counting populated BatcelList[0]
+            # BMSpara[0][0] reports the actual pack/module count directly
+            # and matches this device's real module count exactly - use
+            # that instead. Falls back to counting populated BatcelList[0]
             # slots (which independently gives the same number) if
             # BMSpara is ever missing.
             official = get_nested(("BMSpara", 0, 0))
@@ -1006,7 +1087,7 @@ class FelicitySensor(CoordinatorEntity, SensorEntity):
         data: dict = self.coordinator.data or {}
         key = self.entity_description.key
 
-        # Агрегация по ячейкам для сенсора cell_drift
+        # Per-cell aggregation for the cell_drift sensor
         # NOTE: uses BatcelList[1] (the real per-cell array, ~3.3V each,
         # confirmed against the FSOLAR app) - it previously read
         # BatcelList[0], which is actually the pack/string voltages
