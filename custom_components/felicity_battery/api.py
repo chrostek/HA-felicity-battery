@@ -69,7 +69,7 @@ class FelicityClient:
             set_text = set_raw.replace("'", '"').strip()
             merged: Dict[str, Any] = {}
 
-            # Разбираем несколько JSON-объектов подряд:
+            # Parse several consecutive JSON objects:
             depth = 0
             start = None
             json_objects: list[str] = []
@@ -86,7 +86,7 @@ class FelicityClient:
                             json_objects.append(set_text[start : i + 1])
                             start = None
 
-            # На всякий случай fallback на простое регулярное выражение
+            # Fallback to a simple regex, just in case
             if not json_objects:
                 json_objects = re.findall(r"\{.*?\}", set_text)
 
