@@ -17,11 +17,9 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
-from .sensor import _fallback_model
+from .sensor import _bcu_version, _fallback_model
 
-DEFAULT_MODEL = "Felicity Battery (local API)"
-
-# Порог "большого" разброса по ячейкам, В
+# Threshold for a "large" cell voltage spread, in volts
 CELL_DRIFT_HIGH_THRESHOLD_V = 0.03
 
 
@@ -118,10 +116,13 @@ class FelicityBinarySensor(CoordinatorEntity, BinarySensorEntity):
         data = self.coordinator.data or {}
         serial = data.get("DevSN") or data.get("wifiSN") or self._entry.entry_id
         basic = data.get("_basic") or {}
-        sw_version = basic.get("version")
+        # Same logic as sensor.py's device_info - BCU version in the
+        # "Firmware" field, WiFi module FW as a fallback (also still
+        # available separately as its own sensor).
+        sw_version = _bcu_version(basic) or basic.get("version")
         host = self._entry.data.get(CONF_HOST)
         serial_display = f"{serial} ({host})" if host else serial
-        model = self._entry.data.get("model") or DEFAULT_MODEL
+        model = self._entry.data.get("model") or _fallback_model(basic)
 
         return {
             "identifiers": {(DOMAIN, serial)},
@@ -162,7 +163,7 @@ class FelicityBinarySensor(CoordinatorEntity, BinarySensorEntity):
         estate = data.get("Estate")
         mode = _estate_mode(estate)
         if key == "charging":
-            # по коду состояния + по знаку тока
+            # by state code + by current sign
             if mode == 2 or estate == 9152:
                 return True
             i_raw = get_nested(("Batt", 1, 0))
